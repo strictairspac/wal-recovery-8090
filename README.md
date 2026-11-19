@@ -2,7 +2,7 @@
 海砾计量数据保障组（8人）用可重放日志替代恢复演练时手工拼接的SQL片段和账本截图。
 
 ## 场景与模块
-上游为事务日志样例，下游为值班复核人。原流程人工标记提交、表格算恢复余额、截图写结论；痛点是崩溃点不清、撤销顺序容易错、恢复证据缺失。模块为事务日志集 / 故障注入点 / 恢复队列 / 恢复证据，实体LogSet/CrashCase/Recovery贯穿全栈。
+上游为事务日志样例，下游为值班复核人。原流程人工标记提交、表格算恢复余额、截图写结论；痛点是崩溃点不清、撤销顺序容易错、恢复证据缺失。模块为事务日志集 / 故障注入点 / 恢复队列 / 恢复证据 / 双分库追账，实体LogSet/CrashCase/Recovery/Replication贯穿全栈。
 
 **Python WAL教学模型，不注入真实PostgreSQL故障，不执行数据库物理恢复。** PostgreSQL真实保存业务输入、冻结快照、任务和结果，Redis实际用于worker互斥，后台Python实际演算恢复历史。
 
@@ -26,6 +26,15 @@ SEED_DEMO=true时启动自动执行种子；自然键查重，不覆盖用户修
 ## 一天的复核剧本
 09:00操作员登录；09:05查看海砾采样账本-晚班（A100、B50）；09:10复制日志集保存shift-20261117；09:15在第10条日志后注入断电点；09:20提交恢复；09:25核对检查点LSN4、已提交T3、未提交T2两条写入逆序撤销，最终A60/B50；09:30下载JSON；09:40观察员核对且写操作403；10:00管理员查看/api/audits。
 
+**双分库追账剧本**：10:05进入“双分库追账”，选“断电点10-撤销T2”冻结同步计划——只有T1、T3按提交顺序整笔入账，T2在断电点时未提交、不入账（即便LSN11才commit）。10:10分库A整笔追平（A75→A60），分库B不动；10:15分库B只入账T1，10:20点“模拟回执丢失”让B再入账一笔但确认丢失，点“重试末条回执”得到“重复确认未重复入账”，B账本与进度不变；10:25回收日志，裁切停在未入账事务T3的begin之前LSN4（实际保留LSN5–10，B可从原进度续接）；10:30 B整笔追平，10:35 A追平后再回收至LSN10；全程可在追账台核对账本、进度、回执摘要与保留日志。
+
+## 双分库追账
+两个分库从同一段采样日志追账，快的不用等慢的。源库为断电点前已提交事务（按commit顺序整笔入账）组成的同步计划；每处分库单独保存账本、进度与回执，入账、进度、回执在同一数据库事务落盘。回执表对(分库,事务)唯一，回执丢失后重试按回执识别重复，不重复入账、不改进度。
+
+回收只会裁掉两处分库都用不到的前缀：停在最慢分库未入账事务的begin之前，且绝不把事务裁成两半，因此慢分库能从原进度续接；裁切位置只前进不后退，`dry_run` 只预览不落盘。同步源只保留断电点之前的前缀，断电点之后（含LSN11才commit的T2）本就不属于本次同步。
+
+接口：`POST /replications` 冻结计划并建立两个分库；`POST /replications/{id}/shards/{a|b}/advance` 支持 `limit`、`simulate_receipt_loss`、`receipt`（重试同一事务）；`POST /replications/{id}/reclaim` 支持 `dry_run`；`GET /replications/{id}` 返回账本、进度、回执、核对项与保留日志；`GET /replications/{id}/retained` 返回同步源实际保留的日志前缀。页面在“05 双分库追账”。
+
 ## 算法、格式和失败态
 日志为JSON数组，操作为begin/write/commit/abort/checkpoint；write包含tx/key/value，其他事务操作包含tx，checkpoint不带tx。键必须在初始整数账本存在。事务ID不可复用；严格写锁直到commit/abort释放，同键重叠活动事务拒绝；检查点仅在无活动事务时允许。最多200条日志/30键/整数绝对值不超过10亿。
 
@@ -38,4 +47,6 @@ crash_after=N表示前N条日志已持久化。最近静止检查点保存全部
 
 环境COMPOSE_PROJECT_NAME控制命名，FRONTEND_PORT/BACKEND_PORT/DB_PORT为18246/19246/17746，DB_PASSWORD控制演示数据库密码，JWT_SECRET签名密钥，SEED_DEMO控制种子。命名卷db-data/redis-data/artifacts；共享artifacts预留，导出由冻结快照即时生成。Google Fonts需外网，业务离线可运行。默认凭据仅本地演示。
 
-共享枚举roles与任务states定义于backend/src/constants/enums.py、frontend/src/constants/enums.js，状态使用models/entities.py/services/recovery_service.py/worker.py/components/common/status.js；日志操作类型在schemas/log_set.py和pages/logs.js中声明/说明。MIT许可。真实验证见批次test-artifacts/gb-4107/TESTING.md。
+未设置DATABASE_URL或JWT_SECRET时后端拒绝启动，避免悄悄连到错误的数据源；本地开发请显式设置。测试用SQLite内存库驱动，需先安装requirements并额外安装httpx供TestClient使用：`cd backend && DATABASE_URL=sqlite:////tmp/wal.db JWT_SECRET=test PYTHONPATH=. python -m unittest discover -s tests`。
+
+共享枚举roles与任务states定义于backend/src/constants/enums.py、frontend/src/constants/enums.js，状态使用models/entities.py/services/recovery_service.py/worker.py/components/common/status.js；日志操作类型在schemas/log_set.py和pages/logs.js中声明/说明；双分库枚举（分库名、回收/推进原因）在frontend/src/constants/enums.js。MIT许可。
